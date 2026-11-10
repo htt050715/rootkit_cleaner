@@ -8,6 +8,9 @@ set -o pipefail
 export LC_ALL=C
 umask 077
 
+SCRIPT_FILE="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+# Capture a nohup wrapper log before tee replaces stdout.
+WRAPPER_LOG="$(readlink "/proc/$$/fd/1" 2>/dev/null || true)"
 START_TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)"
 if [[ -d /root && -w /root ]]; then
     LOG_FILE="/root/unitstore-scan-${START_TS}.log"
@@ -64,6 +67,16 @@ has_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
+is_scan_artifact() {
+    local candidate="$1" artifact
+    for artifact in "$SCRIPT_FILE" "$LOG_FILE" "$SUMMARY_FILE" "$LATEST_SUMMARY" "$WRAPPER_LOG"; do
+        if [[ -n "$artifact" && "$candidate" -ef "$artifact" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 run_timeout() {
     local seconds="$1"
     shift
@@ -116,8 +129,12 @@ section "Filesystem name search"
 name_hits=0
 while IFS= read -r path; do
     [[ -z "$path" ]] && continue
+    if is_scan_artifact "$path"; then
+        info "Scanner artifact, not an infection indicator: $path"
+        continue
+    fi
     name_hits=$((name_hits + 1))
-    alert "Filesystem name matches unitstore: $path"
+    found "Filename match only; requires review: $path"
     print_file_details "$path"
 done < <(
     find / -xdev \
@@ -126,7 +143,7 @@ done < <(
 )
 
 if [[ $name_hits -eq 0 ]]; then
-    info "No unitstore filename matches found on the root filesystem."
+    info "No other unitstore filename matches found on the root filesystem."
 fi
 
 section "Dynamic linker preload"
@@ -145,7 +162,7 @@ fi
 
 section "Exact process names"
 
-for process_name in unitstore unitstoreinit; do
+for process_name in unitstore unitstoreinit unitstored; do
     pids="$(pgrep -x "$process_name" 2>/dev/null || true)"
 
     if [[ -n "$pids" ]]; then
@@ -350,17 +367,15 @@ printf 'C2 domain: %s\n' "$C2_DOMAIN"
 
 if has_cmd ss; then
     c2_socket_hits="$(
-        {
-            ss -uapn 2>/dev/null
-            ss -ntup 2>/dev/null
-        } | grep -F -e "$C2_IP" -e "$C2_PORT" || true
+        ss -Huapn 2>/dev/null |
+        awk -v endpoint="$C2_IP:$C2_PORT" '$5 == endpoint'
     )"
 
     if [[ -n "$c2_socket_hits" ]]; then
-        alert "Active socket output contains the suspected C2 IP or port:"
-        printf '%s\n' "$c2_socket_hits"
+        alert "UDP peer exactly matches the reported C2 endpoint:"
+        printf '%s\n' "$c2_socket_hits" | tee -a "$SUMMARY_FILE"
     else
-        info "No active socket matched the suspected C2 IP or port."
+        info "No UDP socket peer exactly matched the reported C2 endpoint."
     fi
 fi
 
@@ -409,24 +424,19 @@ IOC_SEARCH_DIRS=(
 for search_dir in "${IOC_SEARCH_DIRS[@]}"; do
     [[ -d "$search_dir" ]] || continue
 
-    while IFS= read -r hit; do
-        [[ -z "$hit" ]] && continue
-        found "IOC text match in: $hit"
-        grep -In -E -F "$C2_IP" "$hit" 2>/dev/null | head -20 || true
-        grep -In -E -F "$C2_DOMAIN" "$hit" 2>/dev/null | head -20 || true
+    while IFS= read -r -d '' hit; do
+        is_scan_artifact "$hit" && continue
+        if grep -IlF -e "$C2_IP" -e "$C2_DOMAIN" -- "$hit" >/dev/null 2>&1; then
+            found "IOC text match; content requires review: $hit"
+            grep -nIF -m 20 -e "$C2_IP" -e "$C2_DOMAIN" -- "$hit" 2>/dev/null |
+                tee -a "$SUMMARY_FILE" || true
+        fi
     done < <(
-        grep -RIl \
-            --exclude='*.log.*' \
-            --exclude='*.gz' \
-            --exclude='*.zip' \
-            --exclude='*.jpg' \
-            --exclude='*.png' \
-            --exclude='*.iso' \
-            --exclude='*.jar' \
-            --exclude='*.so' \
-            --exclude='*.pyc' \
-            -F -e "$C2_IP" -e "$C2_DOMAIN" \
-            "$search_dir" 2>/dev/null || true
+        find "$search_dir" -xdev -type f \
+            ! -name '*.log.*' ! -name '*.gz' ! -name '*.zip' \
+            ! -name '*.jpg' ! -name '*.png' ! -name '*.iso' \
+            ! -name '*.jar' ! -name '*.so' ! -name '*.pyc' \
+            -print0 2>/dev/null
     )
 done
 
