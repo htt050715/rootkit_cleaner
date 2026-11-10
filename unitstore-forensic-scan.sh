@@ -11,9 +11,21 @@ umask 077
 START_TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)"
 if [[ -d /root && -w /root ]]; then
     LOG_FILE="/root/unitstore-scan-${START_TS}.log"
+    SUMMARY_FILE="/root/unitstore-scan-${START_TS}.summary"
+    LATEST_SUMMARY="/root/unitstore-scan-latest.summary"
 else
     LOG_FILE="./unitstore-scan-${START_TS}.log"
+    SUMMARY_FILE="./unitstore-scan-${START_TS}.summary"
+    LATEST_SUMMARY="./unitstore-scan-latest.summary"
 fi
+
+{
+    printf 'Unitstore forensic scan summary\n'
+    printf 'Started: %s\n' "$(date -Is 2>/dev/null || date)"
+    printf 'Host: %s\n' "$(hostname 2>/dev/null || echo unknown)"
+    printf '\n'
+} >"$SUMMARY_FILE"
+ln -sfn "$SUMMARY_FILE" "$LATEST_SUMMARY" 2>/dev/null || true
 
 if command -v tee >/dev/null 2>&1; then
     exec > >(tee -a "$LOG_FILE") 2>&1
@@ -39,11 +51,13 @@ info() {
 found() {
     OBSERVED=$((OBSERVED + 1))
     printf '[FOUND] %s\n' "$1"
+    printf '[FOUND] %s\n' "$1" >>"$SUMMARY_FILE"
 }
 
 alert() {
     ALERTS=$((ALERTS + 1))
     printf '[ALERT] %s\n' "$1"
+    printf '[ALERT] %s\n' "$1" >>"$SUMMARY_FILE"
 }
 
 has_cmd() {
@@ -497,12 +511,27 @@ fi
 
 section "Summary"
 
+{
+    printf '\nFinished: %s\n' "$(date -Is 2>/dev/null || date)"
+    printf 'Observed items: %s\n' "$OBSERVED"
+    printf 'High-signal alerts: %s\n' "$ALERTS"
+    printf 'Full log: %s\n' "$LOG_FILE"
+    printf 'Summary: %s\n' "$SUMMARY_FILE"
+    printf 'Latest summary: %s\n' "$LATEST_SUMMARY"
+} >>"$SUMMARY_FILE"
+
+printf '\n----- FINAL SUMMARY -----\n'
+cat "$SUMMARY_FILE"
+
 printf 'Observed items: %s\n' "$OBSERVED"
 printf 'High-signal alerts: %s\n' "$ALERTS"
 printf 'Log file: %s\n' "$LOG_FILE"
+printf 'Summary file: %s\n' "$SUMMARY_FILE"
+printf 'Latest summary: %s\n' "$LATEST_SUMMARY"
 
 if [[ $ALERTS -gt 0 ]]; then
     printf '[RESULT] Suspicious indicators were detected; preserve the log and continue with offline triage.\n'
+    printf '[RESULT] Review the alert lines above first; the full log is only for evidence.\n'
     exit 1
 else
     printf '[RESULT] No known unitstore indicators were confirmed.\n'
